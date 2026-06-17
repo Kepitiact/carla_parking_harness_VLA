@@ -1,0 +1,50 @@
+# Environment
+venv/
+env/
+*.pyc
+__pycache__/
+*.egg-info/
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# CARLA simulator install (~26GB; re-download via ParkingScenes/setup_carla.sh).
+# NEVER commit this — individual files exceed GitHub's 100MB limit.
+ParkingScenes/carla/
+
+# Data (large, generated)
+data/raw/episode_*
+data/processed/
+data/plan_cache/
+data/nuscenes/
+logs/*.log
+*.pkl
+*.pth
+*.npz
+
+# Temporary
+*.tmp
+*.bak
+/tmp/
+
+# Keep directory structure with .gitkeep
+!data/raw/.gitkeep
+!data/processed/.gitkeep
+!data/plan_cache/.gitkeep
+!logs/.gitkeep
+
+# Generic coding-guideline docs (not useful to others)
+CLAUDE.md
+EXAMPLES.md

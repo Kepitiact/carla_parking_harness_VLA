@@ -1,0 +1,16 @@
+# Python 3.8 required — CARLA 0.9.14 PyPI wheels do not support Python 3.10+.
+# Install with: pip install -r requirements.txt  (inside a Python 3.8 venv)
+
+carla==0.9.14        # CARLA Python client (must match server version)
+pygame==2.5.0        # needed by Auto_Park event loop
+pyquaternion==0.9.9  # ego2global quaternion construction
+numpy==1.24.4        # last numpy supporting py3.8 with binary wheels
+opencv-python==4.8.0.76  # image saving
+scipy==1.10.1        # used by ParkingScenes MotionPlanning
+cvxpy==1.3.4         # MPC solver in MotionPlanning/Control/MPC.py
+shapely==1.8.2       # used by ParkingScenes collision_check
+matplotlib==3.7.5    # ParkingScenes path planner (costmap.py)
+pandas               # ParkingScenes animation/record_solution.py
+cvxopt               # ParkingScenes path_optimization
+pyomo                # ParkingScenes ocp_optimization
+pyyaml               # ParkingScenes config/read_config.py
