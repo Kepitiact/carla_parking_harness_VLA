@@ -147,6 +147,83 @@ def _compute_side(ax, ay, ayaw, sx, sy):
     return "right" if lateral > 0 else "left"
 
 
+# ── Actor GT: CARLA world 3D boxes -> per-frame lidar-frame gt_boxes ───────────
+# gt_boxes[N,7] = (x, y, z, w, l, h, yaw) in the LIDAR frame. Lidar frame == ego
+# frame (lidar2ego identity): x=forward, y=left, z=up. build_carla_nusc_tables.py
+# must emit one sample_annotation per gt box so len(sample['anns'])==N per frame.
+
+def _gt_from_actors(actor_frame, ego_pose):
+    """Convert one frame's actor GT (CARLA world) to lidar-frame gt arrays.
+
+    actor_frame: {'frame_idx', 'actors': [ {id,type_id,category,world_center,
+                  yaw_deg,size_lwh,velocity}, ... ]} (from actors.json).
+    ego_pose: the matching poses.json record (CARLA world x/y/z/yaw + velocity).
+
+    Returns a dict of numpy arrays matching the infos GT schema.
+    """
+    actors = actor_frame.get('actors', []) if actor_frame else []
+
+    # Ego pose in nuScenes world (flip y, negate yaw), lidar==ego.
+    ex, ey = ego_pose['x_world'], -ego_pose['y_world']
+    eyaw = -math.radians(ego_pose['yaw_deg'])
+    ce, se = math.cos(eyaw), math.sin(eyaw)
+    evx, evy = ego_pose.get('vx_world', 0.0), -ego_pose.get('vy_world', 0.0)
+
+    boxes, names, velos, inds, ins_tokens, num_pts = [], [], [], [], [], []
+    for a in actors:
+        # Actor centre -> nuScenes world (flip y).
+        wx, wy = a['world_center'][0], -a['world_center'][1]
+        wz = a['world_center'][2]
+        ayaw = -math.radians(a['yaw_deg'])
+        # World -> ego/lidar: translate then rotate by -eyaw.
+        dx, dy = wx - ex, wy - ey
+        lx = ce * dx + se * dy      # forward (lidar x)
+        ly = -se * dx + ce * dy     # left    (lidar y)
+        lz = wz - ego_pose['z_world']
+        lyaw = _norm_angle(ayaw - eyaw)
+
+        # size_lwh = [length(x), width(y), height(z)] full dims. gt box wants
+        # (w, l, h) per nuScenes convention (w across, l along heading, h up).
+        length, width, height = a['size_lwh'][0], a['size_lwh'][1], a['size_lwh'][2]
+        # Box centre lidar z is at the box CENTRE; nuScenes origin=(0.5,0.5,0.5)
+        # is honoured by get_ann_info, so keep centre z.
+        boxes.append([lx, ly, lz, width, length, height, lyaw])
+        names.append(a['category'])
+
+        # Actor velocity -> ego frame (relative to ego is NOT applied; nuScenes
+        # gt_velocity is the object's own ground velocity in the ego/lidar frame).
+        avx, avy = a.get('velocity', [0.0, 0.0])
+        avx_n, avy_n = avx, -avy   # CARLA world -> nuScenes world
+        vlx = ce * avx_n + se * avy_n
+        vly = -se * avx_n + ce * avy_n
+        velos.append([vlx, vly])
+
+        inds.append(int(a['id']))
+        ins_tokens.append(f"{a['id']:08d}")
+        # No physical lidar; mark boxes as valid with a nominal point count so
+        # use_valid_flag / num_lidar_pts>0 both keep them.
+        num_pts.append(10)
+
+    n = len(boxes)
+    return {
+        'gt_boxes':      np.array(boxes, dtype=np.float64).reshape(n, 7) if n else np.zeros((0, 7)),
+        'gt_names':      np.array(names, dtype='<U32'),
+        'gt_velocity':   np.array(velos, dtype=np.float64).reshape(n, 2) if n else np.zeros((0, 2)),
+        'gt_inds':       np.array(inds, dtype=np.int64),
+        'gt_ins_tokens': np.array(ins_tokens, dtype='<U32'),
+        'valid_flag':    np.ones(n, dtype=bool),
+        'num_lidar_pts': np.array(num_pts, dtype=np.int32),
+    }
+
+
+def _norm_angle(a):
+    while a > math.pi:
+        a -= 2 * math.pi
+    while a < -math.pi:
+        a += 2 * math.pi
+    return a
+
+
 def _maneuver_labels(meta, poses):
     """Return (maneuver_type, side, target_slot) for an episode.
 
@@ -195,6 +272,14 @@ def build_infos(raw_dir: pathlib.Path, out_path: pathlib.Path,
         with open(poses_path) as f:
             poses = json.load(f)
 
+        # Per-frame actor GT (Task 3). Absent for pre-existing episodes -> empty GT.
+        actors_path = ep_dir / 'actors.json'
+        actor_frames = {}
+        if actors_path.exists():
+            with open(actors_path) as f:
+                for rec in json.load(f):
+                    actor_frames[rec['frame_idx']] = rec
+
         scene_token = meta['episode_id']
         n = len(poses)
 
@@ -223,6 +308,9 @@ def build_infos(raw_dir: pathlib.Path, out_path: pathlib.Path,
             nx, ny, nz, quat = _carla_to_nuscenes_pose(
                 pose['x_world'], pose['y_world'], pose['z_world'], pose['yaw_deg']
             )
+
+            # Per-frame actor GT -> lidar-frame boxes (Task 3/6).
+            gt = _gt_from_actors(actor_frames.get(i), pose)
 
             # can_bus: 18 floats.  [0]=x, [1]=y, [13]=speed, rest=0
             can_bus = np.zeros(18, dtype=np.float64)
@@ -266,15 +354,19 @@ def build_infos(raw_dir: pathlib.Path, out_path: pathlib.Path,
                 'maneuver_type':       maneuver_type,
                 'side':                side,
                 'target_slot':         target_slot,
-                'gt_boxes':            np.zeros((0, 7),  dtype=np.float64),
-                'gt_names':            np.array([],      dtype='<U32'),
-                'gt_velocity':         np.zeros((0, 2),  dtype=np.float64),
-                'gt_inds':             np.zeros(0,       dtype=np.int64),
-                'gt_ins_tokens':       np.array([],      dtype='<U32'),
-                'valid_flag':          np.zeros(0,       dtype=bool),
-                'num_lidar_pts':       np.zeros(0,       dtype=np.int32),
-                'fut_traj':            np.zeros((0, 16, 2), dtype=np.float64),
-                'fut_traj_valid_mask': np.zeros((0, 16, 2), dtype=np.float64),
+                'gt_boxes':            gt['gt_boxes'],
+                'gt_names':            gt['gt_names'],
+                'gt_velocity':         gt['gt_velocity'],
+                'gt_inds':             gt['gt_inds'],
+                'gt_ins_tokens':       gt['gt_ins_tokens'],
+                'valid_flag':          gt['valid_flag'],
+                'num_lidar_pts':       gt['num_lidar_pts'],
+                # Future/past agent trajectories are computed by the dataset's
+                # traj_api from the DB sample_annotation chain (build_carla_nusc_tables);
+                # store zero-motion placeholders sized to N so any direct consumer
+                # sees the right shape (parked cars are static -> zero displacement).
+                'fut_traj':            np.zeros((len(gt['gt_boxes']), 16, 2), dtype=np.float64),
+                'fut_traj_valid_mask': np.ones((len(gt['gt_boxes']), 16, 2), dtype=np.float64),
             }
             infos.append(info)
 

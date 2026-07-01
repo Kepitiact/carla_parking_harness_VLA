@@ -57,3 +57,9 @@ harness/runs/
 # Generic coding-guideline docs (not useful to others)
 CLAUDE.md
 EXAMPLES.md
+
+# Session test/validation artifacts (generated)
+data/raw_astar_test/
+data/gt_overlays/
+data/planner_demos/
+data/planner_profile*/

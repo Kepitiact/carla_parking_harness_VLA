@@ -31,6 +31,7 @@ sys.path.insert(0, str(_REPO))
 
 import carla
 import generate_episodes as ge
+import carla_actor_gt  # shared per-frame actor GT export (Task 3, same as generate_episodes)
 from harness import config as cfg_mod
 from harness.client import scene as scene_mod
 from harness.client import transforms as tf
@@ -198,6 +199,7 @@ def run(cfg, slot_idx=None, seed=None, max_episode_s=None, save_name="episode", 
             dagger_dir = pathlib.Path(log_dagger) / save_name
             dagger_dir.mkdir(parents=True, exist_ok=True)
             npc_boxes = []
+            actors_world = []   # shared rich actor GT (class + id + full 3D box, CARLA world)
             for actor in world.get_actors().filter("vehicle.*"):
                 if ego._player is not None and actor.id == ego._player.id:
                     continue
@@ -207,15 +209,21 @@ def run(cfg, slot_idx=None, seed=None, max_episode_s=None, save_name="episode", 
                     at.location.x, at.location.y, math.radians(at.rotation.yaw))
                 npc_boxes.append({"x": ax_n, "y": ay_n, "yaw": ayaw_n,
                                   "ext_x": bb.extent.x, "ext_y": bb.extent.y})
+                try:
+                    actors_world.append(carla_actor_gt.extract_actor_gt(actor))
+                except Exception:
+                    pass
             (dagger_dir / "run_meta.json").write_text(json.dumps({
                 "save_name": save_name, "slot_idx": scene.slot_idx,
                 "maneuver_type": maneuver, "side": side,
                 "slot_global": slot_global,                 # nuScenes {x,y,yaw}
                 "slot_polygon": slot_polygon,               # nuScenes 4 corners
-                "npcs": npc_boxes,                          # nuScenes centre+yaw+half-extent
+                "npcs": npc_boxes,                          # nuScenes centre+yaw+half-extent (legacy)
+                "actors_world": actors_world,               # CARLA-world 3D box GT + class + id (shared)
                 "cam_order": list(CAM_ORDER),
             }, indent=2))
-            print(f"[dagger] logging states to {dagger_dir} ({len(npc_boxes)} NPC boxes)")
+            print(f"[dagger] logging states to {dagger_dir} "
+                  f"({len(npc_boxes)} NPC boxes, {len(actors_world)} classed actor GT)")
 
         def render_view(stage, pred):
             if viewer is None:

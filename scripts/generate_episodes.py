@@ -31,6 +31,7 @@ import cv2
 
 _REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(_REPO_ROOT / 'ParkingScenes'))
+sys.path.insert(0, str(_REPO_ROOT / 'scripts'))
 
 import carla
 
@@ -53,6 +54,8 @@ _CLOCK = pygame.time.Clock()
 
 from tool import parking_position
 print("[INIT] parking_position imported", flush=True)
+
+import carla_actor_gt  # shared per-frame actor GT export (Task 3)
 
 # ── Monkey-patch ParkingScenes planners for O(1) lookup ──────────────────────
 # Both Dijkstra (compute_h.py) and Hybrid A* (hybrid_a_star.py) use plain
@@ -307,7 +310,34 @@ def _patch_plan_cache():
                 writer.writerow([i, out_x, out_y, out_yaw, v,
                                  _m.sin(out_yaw), _m.cos(out_yaw)])
 
+    # Build the shared obstacle-aware Hybrid A* expert planner (Priority-1).
+    # Imported lazily so a missing module degrades to the RS/stock path instead
+    # of breaking collection.
+    try:
+        import carla_expert_planner as _cep
+        _astar_plan = _cep.make_cached_plan(_REPO_ROOT, orig_plan=_orig_plan,
+                                            max_gear_changes=_MAX_GEAR_CHANGES)
+    except Exception as _e:
+        print(f"[EXPERT] could not init A* expert planner: {_e}", flush=True)
+
+        def _astar_plan(coordinate_rotation, index):
+            raise RuntimeError('carla_expert_planner unavailable')
+
     def _cached_plan(coordinate_rotation, index):
+        # ── Priority-1: obstacle-aware Hybrid A* expert (default) ─────────────
+        # Runs the REAL ParkingScenes Hybrid A* against the LIVE spawned obstacles
+        # (BenchmarkCases/CARLA.csv, written by Auto_Park.perception), verifies the
+        # path is collision-free, and writes it straight to solution/CARLA.csv —
+        # bypassing the slow/fragile pyomo OCP. Cache key hashes the whole case
+        # file so a plan is never reused across a different obstacle subset.
+        # Set CARLA_EXPERT_PLANNER=rs to fall back to the old Reeds-Shepp bypass.
+        if os.environ.get('CARLA_EXPERT_PLANNER', 'astar').lower() != 'rs':
+            try:
+                _astar_plan(coordinate_rotation, index)
+                return
+            except Exception as _e:
+                print(f"[EXPERT] A* unavailable ({_e}) — falling back to RS/stock", flush=True)
+
         # Cache key = "v3" + slot_index + rounded start/goal (1m precision).
         # "v3" invalidates v2 caches (start=rear-axle, goal=center, no WB on goal).
         # Start/goal are unique per map so switching maps gives a cache miss.
@@ -753,8 +783,44 @@ def _get_spawn_transform(slot_location, slot_heading_rad, map_name):
     )
 
 
+def _actor_footprints(actor_gt_frames):
+    """Static-obstacle footprint polygons (CARLA world x,y) from frame-0 actor GT.
+
+    For the BEV overlay in visualize_episode.py. Each polygon is the 4 corners of
+    the actor's world-frame 3D box projected to x,y. Uses the first recorded
+    frame (parked cars are static; a pedestrian's frame-0 pose is representative).
+    """
+    if not actor_gt_frames:
+        return []
+    out = []
+    for a in actor_gt_frames[0].get('actors', []):
+        cx, cy = a['world_center'][0], a['world_center'][1]
+        length, width = a['size_lwh'][0], a['size_lwh'][1]
+        yaw = math.radians(a['yaw_deg'])
+        hl, hw = length / 2.0, width / 2.0
+        fx, fy = math.cos(yaw), math.sin(yaw)     # forward (length axis)
+        lx, ly = -math.sin(yaw), math.cos(yaw)    # left (width axis)
+        corners = [
+            [cx + hl * fx + hw * lx, cy + hl * fy + hw * ly],
+            [cx + hl * fx - hw * lx, cy + hl * fy - hw * ly],
+            [cx - hl * fx - hw * lx, cy - hl * fy - hw * ly],
+            [cx - hl * fx + hw * lx, cy - hl * fy + hw * ly],
+        ]
+        out.append({'polygon': corners, 'category': a['category'], 'id': a['id']})
+    return out
+
+
 def _read_astar_path(coordinate_rotation):
-    """Read the last-generated A* solution path as world-frame waypoints."""
+    """Read the last-generated expert solution path as CARLA world-frame waypoints.
+
+    solution/CARLA.csv is ALWAYS written in CARLA world frame (the expert planner
+    and the RS writer both apply the inverse planning rotation; the stock plan.py
+    rotates the file in place via csv_coordinate_rotation). The MPC tracks it
+    directly in CARLA coordinates, so we read x,y as-is. `coordinate_rotation` is
+    kept for signature compatibility but no longer re-applied (that was a
+    double-transform bug that mirrored the path onto the wrong side of the lot).
+    This path is used only for meta['astar_path_world'] (visualization).
+    """
     current_dir = pathlib.Path(__file__).resolve().parent.parent
     csv_path = current_dir / 'ParkingScenes' / 'tool' / 'AutomatedValetParking' / 'solution' / 'CARLA.csv'
     if not csv_path.exists():
@@ -766,9 +832,6 @@ def _read_astar_path(coordinate_rotation):
         for row in reader:
             try:
                 x, y = float(row[1]), float(row[2])
-                if coordinate_rotation:
-                    # undo the 90° coordinate rotation applied during planning
-                    x, y = y, -x
                 path.append([x, y])
             except (IndexError, ValueError):
                 continue
@@ -818,6 +881,7 @@ def run_episode(carla_world, args, slot_idx, episode_id, save_root):
     print("[EP] controller ready, entering tick loop", flush=True)
 
     poses = []       # pose records only — images written to disk per-tick
+    actor_gt_frames = []  # per-frame actor GT (parked cars / pedestrian boxes + classes)
     frame_count = 0
     tick_count = 0
     goal_hold = 0
@@ -921,6 +985,14 @@ def run_episode(carla_world, args, slot_idx, episode_id, save_root):
                     'brake':            c.brake,
                     'reverse':          c.reverse,
                 })
+                # Per-frame actor GT: parked NPCs + pedestrian boxes + classes,
+                # in CARLA world frame (build_infos_pkl converts to lidar). Static
+                # cars repeat each frame; a walking pedestrian moves per frame.
+                ego_id = ws.player.id if ws.player else None
+                actor_gt_frames.append({
+                    'frame_idx': frame_idx,
+                    'actors': carla_actor_gt.collect_actor_gt(ws._actor_list, ego_id=ego_id),
+                })
                 frame_count += 1
 
             tick_count += 1
@@ -948,6 +1020,9 @@ def run_episode(carla_world, args, slot_idx, episode_id, save_root):
 
     with open(ep_dir / 'poses.json', 'w') as f:
         json.dump(poses, f, indent=2)
+
+    with open(ep_dir / 'actors.json', 'w') as f:
+        json.dump(actor_gt_frames, f, indent=2)
 
     astar_path = _read_astar_path(getattr(controller, '_coordinate_rotation', False))
 
@@ -988,6 +1063,7 @@ def run_episode(carla_world, args, slot_idx, episode_id, save_root):
         'heading_error_at_spawn_rad': heading_error_rad,
         'approach_mode':  approach_mode,
         'astar_path_world': astar_path[:200],
+        'obstacles_world': _actor_footprints(actor_gt_frames),
         'total_frames':   frame_count,
         'sample_rate_hz': RECORD_HZ,
     }
