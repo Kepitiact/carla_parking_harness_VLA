@@ -86,6 +86,94 @@ def _carla_to_nuscenes_pose(x_carla, y_carla, z_carla, yaw_deg):
     return nx, ny, nz, [q.w, q.x, q.y, q.z]
 
 
+def _carla_to_ego_velocity(vx_world, vy_world, yaw_deg):
+    """Measured world velocity (CARLA m/s) -> ego frame [fwd_v, right_v], signed.
+
+    CARLA->nuScenes world: nvx = vx_world, nvy = -vy_world; ego yaw th = -radians(yaw_deg).
+    Rotate the world velocity into the ego frame; matches live_prompt.global_to_local_xy and
+    the gt_ego_lcf_feat [fwd_v, right_v] convention (reverse => fwd_v negative).
+    """
+    th = -math.radians(yaw_deg)
+    nvx = vx_world
+    nvy = -vy_world
+    c, s = math.cos(th), math.sin(th)
+    fwd_v = c * nvx + s * nvy
+    right_v = s * nvx - c * nvy
+    return fwd_v, right_v
+
+
+# ── Maneuver / target-slot labels (nuScenes global frame) ─────────────────────
+# Mirrors generate_episodes.py.  New episodes record these in meta.json (already
+# in nuScenes frame) → copied verbatim.  Pre-existing episodes lack them → derived
+# from the final parked pose + approach geometry.
+
+_DEFAULT_BAY_WIDTH_M = 3.0
+_DEFAULT_BAY_LENGTH_M = 5.5
+
+
+def _yaw_quat(heading_rad):
+    """Quaternion [w, x, y, z] for a pure yaw rotation about +z."""
+    return [math.cos(heading_rad / 2), 0.0, 0.0, math.sin(heading_rad / 2)]
+
+
+def _make_target_slot(cx, cy, cz, heading_rad, width_m, length_m):
+    """Build target_slot (polygon + pose) in the nuScenes global frame.
+
+    Perpendicular bay rectangle: length along the parked heading, width across.
+    Corners ordered front-left, front-right, rear-right, rear-left.
+    """
+    hl, hw = length_m / 2.0, width_m / 2.0
+    fx, fy = math.cos(heading_rad), math.sin(heading_rad)    # forward unit
+    lx, ly = -math.sin(heading_rad), math.cos(heading_rad)   # left unit
+    polygon = [
+        [cx + hl * fx + hw * lx, cy + hl * fy + hw * ly],
+        [cx + hl * fx - hw * lx, cy + hl * fy - hw * ly],
+        [cx - hl * fx - hw * lx, cy - hl * fy - hw * ly],
+        [cx - hl * fx + hw * lx, cy - hl * fy + hw * ly],
+    ]
+    return {
+        "polygon": polygon,
+        "pose": {
+            "translation": [cx, cy, cz],
+            "rotation": _yaw_quat(heading_rad),
+        },
+    }
+
+
+def _compute_side(ax, ay, ayaw, sx, sy):
+    """Side the slot is on relative to the approach heading (nuScenes frame)."""
+    dx, dy = sx - ax, sy - ay
+    lateral = dx * math.sin(ayaw) - dy * math.cos(ayaw)  # d · right
+    return "right" if lateral > 0 else "left"
+
+
+def _maneuver_labels(meta, poses):
+    """Return (maneuver_type, side, target_slot) for an episode.
+
+    Uses meta.json fields when present (new collection format); otherwise derives
+    them from the existing raw: reverse_perpendicular, target_slot from the final
+    parked pose, side from the spawn→slot geometry.
+    """
+    if 'maneuver_type' in meta and 'side' in meta and 'target_slot' in meta:
+        return meta['maneuver_type'], meta['side'], meta['target_slot']
+
+    first, last = poses[0], poses[-1]
+    sx_n, sy_n, _, _ = _carla_to_nuscenes_pose(
+        first['x_world'], first['y_world'], first['z_world'], first['yaw_deg'])
+    syaw_n = -math.radians(first['yaw_deg'])
+    fx_n, fy_n, fz_n, _ = _carla_to_nuscenes_pose(
+        last['x_world'], last['y_world'], last['z_world'], last['yaw_deg'])
+    fheading_n = -math.radians(last['yaw_deg'])
+
+    slot = meta.get('slot', {})
+    width_m = slot.get('width_m', _DEFAULT_BAY_WIDTH_M)
+    length_m = slot.get('length_m', _DEFAULT_BAY_LENGTH_M)
+
+    target_slot = _make_target_slot(fx_n, fy_n, fz_n, fheading_n, width_m, length_m)
+    side = _compute_side(sx_n, sy_n, syaw_n, fx_n, fy_n)
+    return "reverse_perpendicular", side, target_slot
+
+
 def build_infos(raw_dir: pathlib.Path, out_path: pathlib.Path,
                 absolute_paths: bool = False):
     import json
@@ -109,6 +197,9 @@ def build_infos(raw_dir: pathlib.Path, out_path: pathlib.Path,
 
         scene_token = meta['episode_id']
         n = len(poses)
+
+        # Episode-constant maneuver labels (copied from meta or derived for old raw).
+        maneuver_type, side, target_slot = _maneuver_labels(meta, poses)
 
         for i, pose in enumerate(poses):
             token = f"{scene_token}_f{i:04d}"
@@ -139,6 +230,11 @@ def build_infos(raw_dir: pathlib.Path, out_path: pathlib.Path,
             can_bus[1]  = ny
             can_bus[13] = pose['speed_ms']
 
+            # MEASURED ego-state (ego frame, nuScenes signs) for the cache generator to
+            # use instead of the future-derived leak / hardcoded steering.
+            ego_fwd_v, ego_right_v = _carla_to_ego_velocity(
+                pose['vx_world'], pose['vy_world'], pose['yaw_deg'])
+
             info = {
                 'token':                  token,
                 'scene_token':            scene_token,
@@ -159,6 +255,17 @@ def build_infos(raw_dir: pathlib.Path, out_path: pathlib.Path,
                 'reverse':             bool(pose['reverse']),
                 # No other agents in the scene.
                 'reverse':             bool(pose.get('reverse', False)),
+                # MEASURED ego-state (ego frame, m/s / rad·s⁻¹ / [-1,1]) — measured truth so
+                # the cache generator can replace the future-derived ego-state + hardcoded steer.
+                'ego_fwd_v':           ego_fwd_v,
+                'ego_right_v':         ego_right_v,
+                'ego_speed':           pose['speed_ms'],
+                'ego_yaw_rate':        -pose['yaw_rate_rads'],
+                'ego_steer':           pose['steer_normalized'],
+                # Episode-level parking maneuver (conditions the VLA prompt).
+                'maneuver_type':       maneuver_type,
+                'side':                side,
+                'target_slot':         target_slot,
                 'gt_boxes':            np.zeros((0, 7),  dtype=np.float64),
                 'gt_names':            np.array([],      dtype='<U32'),
                 'gt_velocity':         np.zeros((0, 2),  dtype=np.float64),

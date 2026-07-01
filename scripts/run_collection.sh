@@ -58,7 +58,9 @@ except Exception:
 }
 
 current_count() {
-    ls -d "$SAVE"/episode_* 2>/dev/null | wc -l
+    # find (not ls) so an empty SAVE dir returns 0 instead of failing the
+    # pipeline under `set -euo pipefail` (ls exits 2 when the glob matches nothing).
+    find "$SAVE" -maxdepth 1 -name 'episode_*' -type d 2>/dev/null | wc -l
 }
 
 restart_carla

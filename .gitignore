@@ -26,13 +26,22 @@ ParkingScenes/carla/
 
 # Data (large, generated)
 data/raw/episode_*
+data/dagger_raw/
 data/processed/
 data/plan_cache/
 data/nuscenes/
+data/v1.0-mini/
+data/raw_test/
+data/processed_test/
 logs/*.log
 *.pkl
 *.pth
 *.npz
+*.avi
+*.zip
+
+# Harness run outputs (large eval videos / reference tensors)
+harness/runs/
 
 # Temporary
 *.tmp

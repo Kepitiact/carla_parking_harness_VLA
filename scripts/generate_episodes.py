@@ -409,6 +409,10 @@ CAMERAS_6 = {
     "CAM_BACK_RIGHT":  {"x": -1.0, "y":  0.9, "z": 1.5, "pitch": 0, "yaw": 110},
 }
 CAM_W, CAM_H, CAM_FOV = 1600, 900, 70
+# Optional camera sensor_tick (sim-seconds between renders). 0.0 = every tick (collection
+# default, unchanged). The closed-loop harness sets this >0 to render/stream the 6 cameras
+# only at its planning cadence — drastically less network load when CARLA runs on another box.
+CAMERA_SENSOR_TICK = 0.0
 
 SIM_HZ     = 30          # CARLA fixed timestep
 RECORD_HZ  = 2           # frames saved per second
@@ -430,6 +434,58 @@ GOAL_YAW = {
     "Town04_Opt": 180.0,  # slots 17-32 park facing -x (goal_yaw=180°)
     "Town10HD_Opt": 90.0, # facing +y (parallel slot orientation)
 }
+
+# Episode-level maneuver label per map. A string so future scenarios add methods
+# (forward_perpendicular / parallel / angled / multi_point) without code changes.
+MANEUVER_TYPE = {
+    "Town04_Opt": "reverse_perpendicular",
+    "Town10HD_Opt": "parallel",
+}
+
+
+# ── Maneuver / target-slot labels (nuScenes global frame) ─────────────────────
+# These mirror build_infos_pkl.py so the recorded meta.json is already in the
+# frame the pkl/model consume (nuScenes: y-left, right-hand). CARLA→nuScenes:
+# flip y, negate yaw.
+
+def _carla_xy_to_nuscenes(x, y):
+    return x, -y
+
+
+def _yaw_quat(heading_rad):
+    """Quaternion [w, x, y, z] for a pure yaw rotation about +z."""
+    return [math.cos(heading_rad / 2), 0.0, 0.0, math.sin(heading_rad / 2)]
+
+
+def _make_target_slot(cx, cy, cz, heading_rad, width_m, length_m):
+    """Build target_slot (polygon + pose) in the nuScenes global frame.
+
+    Perpendicular bay rectangle: length along the parked heading, width across.
+    Corners ordered front-left, front-right, rear-right, rear-left.
+    """
+    hl, hw = length_m / 2.0, width_m / 2.0
+    fx, fy = math.cos(heading_rad), math.sin(heading_rad)    # forward unit
+    lx, ly = -math.sin(heading_rad), math.cos(heading_rad)   # left unit
+    polygon = [
+        [cx + hl * fx + hw * lx, cy + hl * fy + hw * ly],
+        [cx + hl * fx - hw * lx, cy + hl * fy - hw * ly],
+        [cx - hl * fx - hw * lx, cy - hl * fy - hw * ly],
+        [cx - hl * fx + hw * lx, cy - hl * fy + hw * ly],
+    ]
+    return {
+        "polygon": polygon,
+        "pose": {
+            "translation": [cx, cy, cz],
+            "rotation": _yaw_quat(heading_rad),
+        },
+    }
+
+
+def _compute_side(ax, ay, ayaw, sx, sy):
+    """Side the slot is on relative to the approach heading (nuScenes frame)."""
+    dx, dy = sx - ax, sy - ay
+    lateral = dx * math.sin(ayaw) - dy * math.cos(ayaw)  # d · right
+    return "right" if lateral > 0 else "left"
 
 
 class _CollisionFlag:
@@ -490,6 +546,8 @@ class WorldState:
             bp.set_attribute('image_size_x', str(CAM_W))
             bp.set_attribute('image_size_y', str(CAM_H))
             bp.set_attribute('fov', str(CAM_FOV))
+            if CAMERA_SENSOR_TICK > 0:  # harness-only: render less often (see CAMERA_SENSOR_TICK)
+                bp.set_attribute('sensor_tick', str(CAMERA_SENSOR_TICK))
             tf = carla.Transform(
                 carla.Location(x=spec['x'], y=spec['y'], z=spec['z']),
                 carla.Rotation(pitch=spec['pitch'], yaw=spec['yaw']),
@@ -550,7 +608,7 @@ class WorldState:
             walker.apply_control(ctrl)
             self._actor_list.append(walker)
 
-    def spawn_static_npcs(self, slot_idx, map_name, seed):
+    def spawn_static_npcs(self, slot_idx, map_name, seed, max_npcs=None):
         random.seed(seed)
         if map_name == 'Town04_Opt':
             spawn_pts = parking_position.parking_vehicle_locations_Town04
@@ -569,7 +627,10 @@ class WorldState:
         ]
         pts_shuffled = list(spawn_pts)
         random.shuffle(pts_shuffled)
+        spawned = 0
         for sp in pts_shuffled:
+            if max_npcs is not None and spawned >= max_npcs:  # harness: cap NPC count
+                break
             if sp == target:
                 continue
             # Town04_Opt: skip row-3 (x≈280, west of aisle) — the ego's RS forward
@@ -584,6 +645,7 @@ class WorldState:
             if npc:
                 npc.set_simulate_physics(False)
                 self._actor_list.append(npc)
+                spawned += 1
 
     def drain_sensors(self):
         """Read one frame's worth of sensor data from the queue (blocking)."""
@@ -890,16 +952,33 @@ def run_episode(carla_world, args, slot_idx, episode_id, save_root):
     astar_path = _read_astar_path(getattr(controller, '_coordinate_rotation', False))
 
     geom = SLOT_GEOMETRY.get(args.map, {})
+    slot_w = geom.get('width_m', 2.8)
+    slot_l = geom.get('length_m', 5.5)
+
+    # Episode-level maneuver label from the scenario's known ground truth: the
+    # slot it placed + the parked heading (GOAL_YAW) it drove to. Written in the
+    # nuScenes global frame so build_infos_pkl can copy it verbatim.
+    goal_heading = -math.radians(GOAL_YAW.get(args.map, 0.0))
+    slot_cx_n, slot_cy_n = _carla_xy_to_nuscenes(slot_location.x, slot_location.y)
+    spawn_x_n, spawn_y_n = _carla_xy_to_nuscenes(
+        spawn_transform.location.x, spawn_transform.location.y)
+    spawn_yaw_n = -math.radians(spawn_transform.rotation.yaw)
+
     meta = {
         'episode_id':   f'episode_{episode_id:04d}',
         'map':          args.map,
         'parking_type': geom.get('type', 'unknown'),
+        'maneuver_type': MANEUVER_TYPE.get(args.map, 'reverse_perpendicular'),
+        'side':          _compute_side(spawn_x_n, spawn_y_n, spawn_yaw_n,
+                                       slot_cx_n, slot_cy_n),
+        'target_slot':   _make_target_slot(slot_cx_n, slot_cy_n, slot_location.z,
+                                           goal_heading, slot_w, slot_l),
         'slot': {
             'cx_world':    slot_location.x,
             'cy_world':    slot_location.y,
             'heading_rad': slot_heading_rad,
-            'width_m':     geom.get('width_m', 2.8),
-            'length_m':    geom.get('length_m', 5.5),
+            'width_m':     slot_w,
+            'length_m':    slot_l,
         },
         'spawn': {
             'x_world':    spawn_transform.location.x,
